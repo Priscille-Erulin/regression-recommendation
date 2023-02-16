@@ -4,6 +4,6 @@ def add_one(x):
 def add_two(x):
     return x+2
 
-print(add_one(10))
+print(add_one(5))
 print(add_one(8))
 
