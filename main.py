@@ -7,3 +7,8 @@ def add_two(x):
 print(add_one(10))
 print(add_one(8))
 
+def add_three(x):
+    return x+3
+
+print(add_tree(3))
+
