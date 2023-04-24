@@ -1,12 +1,8 @@
-def add_one(x):
-    return x+1
+import pandas as pd
 
-def add_two(x):
-    return x+2
+df = pd.DataFrame({'num_legs': [2, 4, 8, 0],
+                   'num_wings': [2, 0, 0, 0],
+                   'num_specimen_seen': [10, 2, 1, 8]},
+                  index=['falcon', 'dog', 'spider', 'fish'])
 
-print(add_one(5))
-print(add_one(8))
-
-def add_three(x):
-    return x+3
-
+print(df.groupby('num_legs')['num_specimen_seen'].sum())
