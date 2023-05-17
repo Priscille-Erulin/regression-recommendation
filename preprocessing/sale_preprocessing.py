@@ -11,7 +11,7 @@ num_columns = ['log_Followers',
 
 log_columns = ['Followers', 'Avg Price', 'First Day Revenue', 'Brand Appearance']
 
-def adding_log(train: pd.DataFrame, columns_to_log: list = log_columns):
+def adding_log(train: pd.DataFrame, columns_to_log: list):
     """ 
     Adding columns using log of provided information.
     """
@@ -24,7 +24,7 @@ def adding_log(train: pd.DataFrame, columns_to_log: list = log_columns):
         
     return (new_train)
 
-def scale(df, scaler, numerical_columns: list = num_columns):
+def scale(df, scaler, numerical_columns: list ):
     """
     Returns dataframe with the given columns scaled.
     """
@@ -34,7 +34,7 @@ def scale(df, scaler, numerical_columns: list = num_columns):
 
     return (new_train)
 
-def sales_pre_pocessing(all_sales, cols_to_log, scaler, cols_to_scale):
+def sales_pre_pocessing(all_sales, scaler, cols_to_log = log_columns,  cols_to_scale = num_columns):
 
     dummies_category = pd.get_dummies(all_sales['Category'])
     dummies_badges = all_sales['Badges'].str.strip('{}').str.replace('"', '').str.get_dummies(',')
