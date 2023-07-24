@@ -1,0 +1,363 @@
+
+import datetime
+import operator
+import typing
+
+import pydantic
+import redis.asyncio
+import logging
+import sales_inference.types
+
+
+EXPIRATION: typing.Final = datetime.timedelta(days=4)
+
+log = logging.getLogger(__name__)
+
+
+class CacheResult(typing.NamedTuple):
+    """
+    Model together with an optional cached sales listing for user.
+    """
+
+    model: sales_inference.types.Model
+
+    recommendation: typing.Optional[sales_inference.types.SalesRecommendation]
+
+
+class CacheResultsWithAlerts(typing.NamedTuple):
+    """
+    Model together with optional cached sales listing and alerts for user.
+    """
+    model: sales_inference.types.Model
+
+    recommendation: typing.Optional[sales_inference.types.SalesRecommendation]
+
+    alerts: typing.Optional[sales_inference.types.Alerts]
+
+
+class Engine:
+    """
+    Sales recommendation engine.
+
+    The model is simply persited to redis. That implies that the actual
+    inference step just involves a simple lookup together with an update of
+    user metadata to track the last visit of a user.
+    """
+
+    MODEL_KEY: typing.Final[str] = 'sales_engine:sales'
+
+    USER_FMT: typing.Final[str] = 'reco:sales:{uid:s}'
+
+    def __init__(self, redis_host: str, redis_port: int,
+                 redis_pool_size: typing.Optional[int] = None):
+        """
+        Create a new engine instance for sales recommendation inference.
+
+        :param redis_host: redis hostname or IP
+        :param redis_port: redis TCP port
+        :param redis_pool_size: maximum open connections to redis
+        """
+        self._redis = redis.asyncio.Redis(host=redis_host, port=redis_port,
+                                          max_connections=redis_pool_size)
+
+    async def _fetch_user_recommendation(self, uid: str) -> CacheResult:
+        """
+        Get a tuple of the model and previous listing of sales for a user.
+
+        :param uid: user to get the listing for
+        :return: tuple of model and previous recommendation for a user
+        """
+        pipeline = self._redis.pipeline()
+        pipeline.get(self.MODEL_KEY)
+        pipeline.get(self.USER_FMT.format(uid=uid))
+        raw_model, raw_cached_recommendation = await pipeline.execute()
+        model = pydantic.parse_raw_as(sales_inference.types.Model, raw_model)
+        if raw_cached_recommendation:
+            user_previous_recommendation = pydantic.parse_raw_as(
+                type_=sales_inference.types.SalesRecommendation,
+                b=raw_cached_recommendation,
+            )
+        else:
+            user_previous_recommendation = None
+        return CacheResult(model, user_previous_recommendation)
+
+    async def _put_user_recommendation(
+            self,
+            uid: str,
+            recommendation: sales_inference.types.SalesRecommendation):
+        """
+        Put a recommendation result for a user to redis under an expirable key.
+
+        :param uid: user id to associate recommendation with
+        :param recommendation: ordered recommendation result
+        """
+        await self._redis.setex(
+            name=self.USER_FMT.format(uid=uid),
+            value=recommendation.json(),
+            time=EXPIRATION,
+        )
+
+    def _n_to_top(self, top: typing.List[str], bottom: typing.List[str],
+                  n: int) -> sales_inference.types.SalesList:
+        """
+        Create a top list with n elements, leaving the rest at the bottom.
+
+        :param n: number of elements to bring to the top
+        :param top: top list to take elements from
+        :param bottom: bottom list to take elements from if top argument does
+                       not hold enough elements
+        :return: sales lists (top, bottom) where top holds max `n` elements
+        """
+        union = top + bottom
+        return sales_inference.types.SalesList(
+            top=union[:n],
+            bottom=union[n:],
+        )
+
+    def _end_with_choose(self, top: typing.List[str],
+                         bottom: typing.List[str]
+                         ) -> (typing.List[str], typing.List[str]):
+        """
+        Remove choose gift card and put it at the end of bottom.
+        """
+        if 'fcba9db5cae341cca6e6d3b7f' in top:
+            top.remove('fcba9db5cae341cca6e6d3b7f')
+        if 'fcba9db5cae341cca6e6d3b7f' in bottom:
+            bottom.remove('fcba9db5cae341cca6e6d3b7f')
+        bottom.append('fcba9db5cae341cca6e6d3b7f')
+        return (top, bottom)
+
+    def _mk_recommendation(self, ongoing: typing.List[str],
+                           previous: sales_inference.types.SalesRecommendation,
+                           model: sales_inference.types.Model,
+                           ) -> sales_inference.types.SalesRecommendation:
+        """
+        Make a sales recommendation list based on the current model.
+
+        :param ongoing: list of on-going sales (sale ids)
+        :param previous: previously given recommendation for a user
+        :param model: recommendation as defined by the model
+        :return: ordered sales recommendation
+        """
+        ongoing_ = set(ongoing)
+        seen_top = set(previous.reco.top) & ongoing_
+        seen_bottom = set(previous.reco.bottom) & ongoing_
+        seen = seen_top | seen_bottom
+        unseen = [s for s in ongoing if s not in seen]  # preserve order
+
+        if not unseen:
+            return sales_inference.types.SalesRecommendation(
+                reco=self._n_to_top(
+                    # Keep previous order of seen sales
+                    top=[s for s in previous.reco.top if s in seen_top],
+                    bottom=[s for s in previous.reco.bottom
+                            if s in seen_bottom],
+                    n=len(previous.reco.top),
+                ),
+                last_time=previous.last_time,
+            )
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            new_visitor = not previous.reco.top and not previous.reco.bottom
+            if new_visitor or now - previous.last_time > EXPIRATION:
+                n = 2 + len([sale.sale_id for sale in model.sales
+                             if sale.is_new])
+                # top sales
+                best_sales = sorted(model.sales,
+                                    key=lambda x: x.score,
+                                    reverse=True)[:2]
+                # new sales first
+                other_sales = sorted(model.sales,
+                                     key=lambda x: (x.is_new, x.score),
+                                     reverse=True)
+                model_listing = ([record.sale_id
+                                  for record in best_sales] +
+                                 [record.sale_id
+                                  for record in other_sales
+                                  if record not in best_sales]
+                                 )
+            elif len(unseen) == 1:
+                n = len(seen_top) + 1
+                model_listing = [record.sale_id for record in
+                                 sorted(model.sales,
+                                        key=operator.attrgetter('score'),
+                                        reverse=True)]
+            else:
+                n = len(unseen)
+                model_listing = [record.sale_id for record in
+                                 sorted(model.sales,
+                                        key=operator.attrgetter('score'),
+                                        reverse=True)]
+            top = ([s for s in unseen if s not in model_listing] +
+                   [s for s in model_listing if s in unseen])
+            # Seen sales at the bottom
+            bottom = [
+                s for s in (previous.reco.top + previous.reco.bottom)
+                if s in seen
+            ]
+            top, bottom = self._end_with_choose(top, bottom)
+            # Keep `n` sales in top section, rest on the bottom
+            return sales_inference.types.SalesRecommendation(
+                reco=self._n_to_top(top, bottom, n),
+                last_time=now,
+            )
+
+    async def recommend(self, ongoing: typing.List[str],
+                        uid: str) -> sales_inference.types.SalesList:
+        """
+        Make a listing of recommended sales for a given user.
+
+        :param ongoing: list of on-going sales (sale ids)
+        :param uid: user identifier
+        :return: listing of sale ids, composed by top and bottom sub-lists
+        """
+        cache_result = await self._fetch_user_recommendation(uid)
+        model, prior_recommendation = cache_result
+        if not prior_recommendation:
+            prior_recommendation = sales_inference.types.SalesRecommendation(
+                reco=sales_inference.types.SalesList(top=[], bottom=[]),
+                last_time=datetime.datetime.now(datetime.timezone.utc),
+            )
+
+        recommendation = self._mk_recommendation(
+            ongoing=ongoing,
+            previous=prior_recommendation,
+            model=model,
+        )
+        if recommendation.last_time != prior_recommendation.last_time:
+            await self._put_user_recommendation(uid, recommendation)
+        log.info(f"Ranked sales for user {uid}: {recommendation.reco}")
+        return recommendation.reco
+
+
+class AlertsEngine(Engine):
+    """
+    Sales recommendation engine including alerts.
+
+    The model inherits from the recommendation model above. On top of that,
+    it extracts the alerts set by the userfrom redis and puts at the top of
+    the recommendation, the unseen alerts.
+    """
+
+    ALERTS_FORMAT: typing.Final[str] = 'uwr:sales:{uid:s}'
+
+    async def _fetch_user_recommendation(
+            self,
+            uid: str
+            ) -> CacheResultsWithAlerts:
+        """
+        Get a tuple of the model, previous listing of sales and alerts
+        set for a user.
+
+        :param uid: user to get the listing and alerts for
+        :return: tuple of model, previous recommendation and
+        alerts for a user
+        """
+        pipeline = self._redis.pipeline()
+        pipeline.get(self.MODEL_KEY)
+        pipeline.get(self.USER_FMT.format(uid=uid))
+        pipeline.get(self.ALERTS_FORMAT.format(uid=uid))
+        (raw_model,
+         raw_cached_recommendation,
+         raw_cached_alerts
+         ) = await pipeline.execute()
+        model = pydantic.parse_raw_as(sales_inference.types.Model, raw_model)
+
+        if raw_cached_recommendation:
+            user_previous_recommendation = pydantic.parse_raw_as(
+                type_=sales_inference.types.SalesRecommendation,
+                b=raw_cached_recommendation,
+            )
+        else:
+            user_previous_recommendation = None
+
+        # condition for no alerts
+        if raw_cached_alerts:
+            user_alerts = pydantic.parse_raw_as(sales_inference.types.Alerts,
+                                                raw_cached_alerts)
+        else:
+            user_alerts = None
+        return CacheResultsWithAlerts(model,
+                                      user_previous_recommendation,
+                                      user_alerts)
+
+    def _mk_recommendation(self, ongoing: typing.List[str],
+                           previous: sales_inference.types.SalesRecommendation,
+                           model: sales_inference.types.Model,
+                           alerts: sales_inference.types.Alerts
+                           ) -> sales_inference.types.SalesRecommendation:
+        """
+        Make a sales recommendation by inheriting from
+        the standard recommendation logic and
+        adding the unseen alerts at the top.
+
+        :param ongoing: list of on-going sales (sale ids)
+        :param previous: previously given recommendation for a user
+        :param model: recommendation as defined by the model
+        :param alerts: list of alerts set by the user
+        :return: ordered sales recommendation
+        """
+        # inherits from the standard recommendation logic
+        recommendation = super()._mk_recommendation(ongoing, previous, model)
+        seen_sales = set(previous.reco.top) | set(previous.reco.bottom)
+        seen_alerts = set(alerts) & seen_sales
+        unseen_alerts = [i for i in alerts if i in ongoing if i not in
+                         seen_alerts]
+
+        # according to the product logic, we keep the same
+        # number of sales in the top part
+        n = len(recommendation.reco.top)
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        all_sales = recommendation.reco.top + recommendation.reco.bottom
+        # ordered sales that are not unseen alerts
+        not_alerts = [i for i in all_sales if i not in unseen_alerts]
+
+        # places the unseen alerts at the beginning of the top list
+        return sales_inference.types.SalesRecommendation(
+            reco=self._n_to_top(unseen_alerts, not_alerts, n),
+            last_time=now,
+            )
+
+    async def recommend(self,
+                        ongoing: typing.List[str],
+                        uid: str) -> sales_inference.types.SalesList:
+        """
+        Make a listing of recommended sales for a given user with
+        the alerts logic in place.
+
+        :param ongoing: list of on-going sales (sale ids)
+        :param uid: user identifier
+        :return: listing of sale ids, composed by top and bottom sub-lists
+        with any unseen alerts at the beginning of top
+        """
+        cache_result = await self._fetch_user_recommendation(uid)
+        model, prior_recommendation, set_alerts = cache_result
+
+        # changes the prior recommendations
+        # in an empty SalesRecommendation instead
+        # of None if there are no prior recommendations
+        if not prior_recommendation:
+            prior_recommendation = sales_inference.types.SalesRecommendation(
+                reco=sales_inference.types.SalesList(top=[], bottom=[]),
+                last_time=datetime.datetime.now(datetime.timezone.utc),
+            )
+        # changes the alerts in an empty
+        # list instead of None if there are no alerts
+        if not set_alerts:
+            set_alerts = []
+
+        # sorted by putting unseen alerts at the beginning of the top sub-list
+        sorted_recommendation = self._mk_recommendation(
+            ongoing=ongoing,
+            previous=prior_recommendation,
+            model=model,
+            alerts=set_alerts,
+        )
+        # puts the new recommendation in the cache
+        if sorted_recommendation.last_time != prior_recommendation.last_time:
+            await self._put_user_recommendation(uid, sorted_recommendation)
+        log.info(
+            f"Alerts - Ranked sales user {uid}:{sorted_recommendation.reco}"
+                 )
+        return sorted_recommendation.reco
